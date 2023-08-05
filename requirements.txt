@@ -11,3 +11,4 @@ pandas==2.0.3
 timm==0.9.5
 scipy==1.10.1
 imageio==2.31.1
+git+https://github.com/m43/sam-hq.git@3438d80e87ccc8db6eb836de53f17f02740b503f

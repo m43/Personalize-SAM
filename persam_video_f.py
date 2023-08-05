@@ -1,20 +1,48 @@
-import argparse, os
-from PIL import Image
+import argparse
+import os
+import random
 from os import path
+
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
+from segment_anything_hq import SamPredictor as HqSamPredictor, sam_model_registry as hq_sam_model_registry
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from per_segment_anything import SamPredictor, sam_model_registry
+
 from davis2017.davis import DAVISTestDataset, all_to_onehot
 from eval_video import eval_davis_result
+from per_segment_anything import SamPredictor, sam_model_registry
+
+
+def seed_all(seed):
+    """
+    Seed all random number generators.
+
+    Parameters
+    ----------
+    seed : int
+        The seed to use.
+
+    Returns
+    -------
+    None
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 def main(args):
     if args.eval:
         eval_davis_result(args.output_path, args.davis_path)
         return
-    
+
     # Traing paremeters
     lr = args.lr
     train_epochs = args.epoch
@@ -24,7 +52,8 @@ def main(args):
     print("Running on DAVIS", args.dataset_set)
     test_dataset = DAVISTestDataset(args.davis_path, imset=args.dataset_set + '/val.txt')
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
-    palette = Image.open(path.expanduser(os.path.join(args.davis_path, 'Annotations/480p/bike-packing/00000.png'))).getpalette()
+    palette = Image.open(
+        path.expanduser(os.path.join(args.davis_path, 'Annotations/480p/bike-packing/00000.png'))).getpalette()
 
     # Load SAM
     sam_type, sam_ckpt = 'vit_h', 'sam_vit_h_4b8939.pth'
@@ -33,9 +62,17 @@ def main(args):
         param.requires_grad = False
     predictor = SamPredictor(sam)
 
+    # Load HQ-SAM
+    hqsam_predictor = None
+    if args.hqsam:
+        sam_checkpoint = "sam_hq_vit_h.pth"
+        model_type = "vit_h"
+        hqsam = hq_sam_model_registry[model_type](checkpoint=sam_checkpoint).cuda()
+        hqsam_predictor = HqSamPredictor(hqsam)
+
     # Start eval
     for iter, data in enumerate(test_loader):
-        rgb = data['rgb'].cpu().numpy() 
+        rgb = data['rgb'].cpu().numpy()
         msk = data['gt'][0].cpu().numpy()
         info = data['info']
         name = info['name'][0]
@@ -46,14 +83,16 @@ def main(args):
             print("File", name, "exists in", args.output_path, ", skip...")
             continue
         num_obj = len(info['labels'][0])
-   
+
+        seed_all(args.seed)
+
         frame_num = rgb.shape[1]
 
         save_path = args.output_path + '/{}/'.format(name)
         os.makedirs(save_path, exist_ok=True)
-        first_frame_image = rgb[0, 0] 
-        first_frame_mask = msk[:, 0] * args.exp 
-        
+        first_frame_image = rgb[0, 0]
+        first_frame_mask = msk[:, 0] * args.exp
+
         fore_feat_list = []
         # Foreground features
         input_boxes = []
@@ -66,9 +105,12 @@ def main(args):
             print("Processing Object", obj)
             frame_image = first_frame_image
 
-            obj_mask = first_frame_mask[obj].reshape(first_frame_mask.shape[1], first_frame_mask.shape[2], 1) #(480, 910, 1)
-            obj_mask = np.concatenate((obj_mask, np.zeros((obj_mask.shape[0], obj_mask.shape[1], 2), dtype=obj_mask.dtype)), axis=2)  #(480, 910, 3)
-            
+            obj_mask = first_frame_mask[obj].reshape(first_frame_mask.shape[1], first_frame_mask.shape[2],
+                                                     1)  # (480, 910, 1)
+            obj_mask = np.concatenate(
+                (obj_mask, np.zeros((obj_mask.shape[0], obj_mask.shape[1], 2), dtype=obj_mask.dtype)),
+                axis=2)  # (480, 910, 3)
+
             train_mask = torch.tensor(obj_mask)[:, :, 0] > 0
             train_mask = train_mask.float().unsqueeze(0).repeat(1, 1, 1).flatten(1).cuda()
 
@@ -76,9 +118,9 @@ def main(args):
             if obj == 0:
                 img_feat1 = predictor.features.squeeze().permute(1, 2, 0)
             obj_mask = F.interpolate(obj_mask, size=img_feat1.shape[0:2], mode="bilinear")
-            obj_mask = obj_mask.squeeze()[0] 
+            obj_mask = obj_mask.squeeze()[0]
 
-            fore_feat = img_feat1[obj_mask > 0] 
+            fore_feat = img_feat1[obj_mask > 0]
 
             if fore_feat.shape[0] == 0:
                 fore_feat = fore_feat.mean(0)
@@ -89,7 +131,7 @@ def main(args):
                 fore_feat = (fore_feat_max / 2 + fore_feat_mean / 2).unsqueeze(0)
                 fore_feat = fore_feat / fore_feat.norm(dim=-1, keepdim=True)
             fore_feat_list.append(fore_feat)
-                
+
             # pred masks
             test_feat = predictor.features.squeeze()
             C, htest, wtest = test_feat.shape
@@ -103,12 +145,12 @@ def main(args):
             sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
 
             mask_sim = predictor.model.postprocess_masks(
-                            sim,
-                            input_size=predictor.input_size,
-                            original_size=predictor.original_size).squeeze()
+                sim,
+                input_size=predictor.input_size,
+                original_size=predictor.original_size).squeeze()
 
             w, h = mask_sim.shape
-            
+
             topk_xy_i, topk_label_i = point_selection(mask_sim, topk=args.topk)
             topk_xy = topk_xy_i
             topk_label = topk_label_i
@@ -139,10 +181,10 @@ def main(args):
             print('======> Start Training')
             for train_idx in range(train_epochs):
                 masks, scores, logits, logits_high = predictor.predict(
-                            point_coords=topk_xy,
-                            point_labels=topk_label,
-                            box=input_box_[None, :],
-                            multimask_output=True)
+                    point_coords=topk_xy,
+                    point_labels=topk_label,
+                    box=input_box_[None, :],
+                    multimask_output=True)
                 logits_high = logits_high.flatten(1)
                 # weight
                 weight = torch.cat((1 - mask_weights.weights.sum(0).unsqueeze(0), mask_weights.weights), dim=0)
@@ -161,18 +203,19 @@ def main(args):
                 if train_idx % log_epochs == 0:
                     print('Train Epoch: {:} / {:}'.format(train_idx, train_epochs))
                     current_lr = scheduler.get_last_lr()[0]
-                    print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(), focal_loss.item()))
+                    print('LR: {:.6f}, Dice_Loss: {:.4f}, Focal_Loss: {:.4f}'.format(current_lr, dice_loss.item(),
+                                                                                     focal_loss.item()))
             mask_weights_list.append(mask_weights)
 
-        for i in range (1, frame_num):
-            current_img = rgb[0, i] 
+        for i in range(1, frame_num):
+            current_img = rgb[0, i]
             predictor.set_image(current_img)
-            test_feat = predictor.features.squeeze() #[256, 64, 64] 
+            test_feat = predictor.features.squeeze()  # [256, 64, 64]
             C, htest, wtest = test_feat.shape
 
             test_feat = test_feat / test_feat.norm(dim=0, keepdim=True)
             test_feat = test_feat.reshape(C, htest * wtest)
-            
+
             concat_mask = np.zeros((1, first_frame_mask.shape[1], first_frame_mask.shape[2]), dtype=np.uint8)
             for j in range(min(len(fore_feat_list), len(input_boxes))):
                 mask_weights = mask_weights_list[j]
@@ -189,17 +232,17 @@ def main(args):
                 sim = F.interpolate(sim, scale_factor=4, mode="bilinear")
 
                 mask_sim = predictor.model.postprocess_masks(
-                                sim,
-                                input_size=predictor.input_size,
-                                original_size=predictor.original_size).squeeze()
+                    sim,
+                    input_size=predictor.input_size,
+                    original_size=predictor.original_size).squeeze()
 
                 # Top-1 point selection
                 w, h = mask_sim.shape
-                
+
                 topk_xy_i, topk_label_i = point_selection(mask_sim, topk=args.topk)
                 topk_xy = topk_xy_i
                 topk_label = topk_label_i
-                    
+
                 if args.center:
                     topk_label = np.concatenate([topk_label, [1]], axis=0)
 
@@ -208,10 +251,10 @@ def main(args):
                     if args.center:
                         topk_xy = np.concatenate((topk_xy, center), axis=0)
                     masks, scores, logits, logits_high = predictor.predict(
-                                point_coords=topk_xy,
-                                point_labels=topk_label,
-                                box=input_box_[None, :],
-                                multimask_output=True)
+                        point_coords=topk_xy,
+                        point_labels=topk_label,
+                        box=input_box_[None, :],
+                        multimask_output=True)
                 # Weight
                 logits_high = logits_high * weight.unsqueeze(-1)
                 logit_high = logits_high.sum(0)
@@ -221,12 +264,12 @@ def main(args):
                 logit = logits.sum(0)
 
                 scores = scores * weight_np[0]
-                
+
                 y, x = np.nonzero(mask)
                 if len(x) == 0 or len(y) == 0:
                     mask = masks[np.argmax(scores)]
                     y, x = np.nonzero(mask)
-                    
+
                 x_min = x.min()
                 x_max = x.max()
                 y_min = y.min()
@@ -234,11 +277,11 @@ def main(args):
                 input_box = np.array([x_min, y_min, x_max, y_max])
 
                 masks, scores, logits, _ = predictor.predict(
-                            point_coords=topk_xy,
-                            point_labels=topk_label,
-                            box=input_box[None, :],
-                            mask_input=logit[None, :, :],
-                            multimask_output=True)
+                    point_coords=topk_xy,
+                    point_labels=topk_label,
+                    box=input_box[None, :],
+                    mask_input=logit[None, :, :],
+                    multimask_output=True)
                 ic_index = np.argmax(scores)
 
                 # box refine
@@ -252,25 +295,68 @@ def main(args):
                     point_coords=topk_xy,
                     point_labels=topk_label,
                     box=input_box[None, :],
-                    mask_input=logits[ic_index: ic_index + 1, :, :], 
+                    mask_input=logits[ic_index: ic_index + 1, :, :],
                     multimask_output=True,
                     return_logits=True)
 
                 ic_index = np.argmax(scores)
-                concat_mask = np.concatenate((concat_mask, masks[ic_index].reshape(1, masks.shape[1], masks.shape[2])), axis=0)
-                
+                concat_mask = np.concatenate((concat_mask, masks[ic_index].reshape(1, masks.shape[1], masks.shape[2])),
+                                             axis=0)
+
             current_mask_pred = np.argmax(concat_mask, axis=0).astype(np.uint8)
-            output = Image.fromarray(current_mask_pred)
-            output.putpalette(palette)
-            output.save(save_path + '{:05d}.png'.format(i))
+
+            # Refine the masks using HQ-SAM
+            if args.hqsam:
+                print("Refine the mask using HQ-SAM. Frame", i, "for video", info["name"], ".")
+                n_masks = len(fore_feat_list)
+                hqsam_predictor.set_image(current_img)
+                hqsam_logits = np.concatenate([np.ones(current_mask_pred.shape)[None] * -np.inf
+                                               for _ in range(n_masks + 1)])
+                hqsam_logits[0] = 0.0  # Let the background logits be equal to SAM's mask threshold
+                boxes = []
+                for mask_idx in range(1, n_masks + 1):
+                    m = current_mask_pred == mask_idx
+                    if m.sum() == 0:
+                        print("No mask for object", mask_idx, "in frame", i, "for video", info["name"], ". Skip.")
+                        continue
+                    y, x = np.nonzero(m)
+                    x_min = x.min()
+                    x_max = x.max()
+                    y_min = y.min()
+                    y_max = y.max()
+                    input_box = np.array([x_min, y_min, x_max, y_max])
+                    masks, scores, logits = hqsam_predictor.predict(
+                        # point_coords=topk_xy,  point_labels=topk_label,
+                        box=input_box[None, :],
+                        multimask_output=False,
+                        # mask_input=logits,
+                        return_logits=True,
+                    )
+                    hqsam_logits[mask_idx] = masks[0]
+                    boxes.append(input_box)
+                hqsam_mask_pred = np.argmax(hqsam_logits, axis=0).astype(np.uint8)
+                assert hqsam_mask_pred.shape == current_mask_pred.shape
+
+                output = Image.fromarray(current_mask_pred)
+                output.putpalette(palette)
+                output.save(save_path + '{:05d}.persam.png'.format(i))
+
+                output = Image.fromarray(hqsam_mask_pred)
+                output.putpalette(palette)
+                output.save(save_path + '{:05d}.png'.format(i))
+            else:
+                output = Image.fromarray(current_mask_pred)
+                output.putpalette(palette)
+                output.save(save_path + '{:05d}.png'.format(i))
 
             if args.box_prompt:
                 cur_labels = np.unique(current_mask_pred)
-                cur_labels = cur_labels[cur_labels!=0]
+                cur_labels = cur_labels[cur_labels != 0]
                 input_boxes = all_to_onehot(current_mask_pred, cur_labels)
         print(f"Finish predict video: {name}")
 
     eval_davis_result(args.output_path, args.davis_path)
+
 
 def get_box_prompt(img, threshold):
     rows = np.any(img, axis=1)
@@ -278,19 +364,21 @@ def get_box_prompt(img, threshold):
     rmin, rmax = np.where(rows)[0][[0, -1]]
     cmin, cmax = np.where(cols)[0][[0, -1]]
 
-    cmin = 0 if cmin - threshold <= 0 else cmin - threshold 
+    cmin = 0 if cmin - threshold <= 0 else cmin - threshold
     rmin = 0 if rmin - threshold <= 0 else rmin - threshold
     cmax = img.shape[1] if cmax + threshold >= img.shape[1] else cmax + threshold
     rmax = img.shape[0] if rmax + threshold >= img.shape[0] else rmax + threshold
-   
-    return np.array([[(cmin + cmax) // 2, (rmin + rmax) // 2]]), np.array([cmin,rmin,cmax,rmax]) # x1,y1,x2,y2
+
+    return np.array([[(cmin + cmax) // 2, (rmin + rmax) // 2]]), np.array([cmin, rmin, cmax, rmax])  # x1,y1,x2,y2
+
 
 class Mask_Weights(nn.Module):
     def __init__(self):
         super().__init__()
         self.weights = nn.Parameter(torch.ones(2, 1, requires_grad=True) / 3)
 
-def calculate_dice_loss(inputs, targets, num_masks = 1):
+
+def calculate_dice_loss(inputs, targets, num_masks=1):
     """
     Compute the DICE loss, similar to generalized IOU for masks
     Args:
@@ -308,7 +396,7 @@ def calculate_dice_loss(inputs, targets, num_masks = 1):
     return loss.sum() / num_masks
 
 
-def calculate_sigmoid_focal_loss(inputs, targets, num_masks = 1, alpha: float = 0.25, gamma: float = 2):
+def calculate_sigmoid_focal_loss(inputs, targets, num_masks=1, alpha: float = 0.25, gamma: float = 2):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
@@ -335,6 +423,7 @@ def calculate_sigmoid_focal_loss(inputs, targets, num_masks = 1, alpha: float = 
 
     return loss.mean(1).sum() / num_masks
 
+
 def point_selection(mask_sim, topk=1):
     w, h = mask_sim.shape
     topk_xy = mask_sim.flatten(0).topk(topk)[1]
@@ -345,6 +434,7 @@ def point_selection(mask_sim, topk=1):
     topk_xy = topk_xy.cpu().numpy()
     return topk_xy, topk_label
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_path", type=str, help="output path", required=True)
@@ -352,6 +442,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_set", type=str, help="2017", default='2017')
     parser.add_argument("--topk", type=int, help="choose topk points", default=1)
     parser.add_argument("--epoch", type=int, help="epoch number", default=800)
+    parser.add_argument("--seed", type=int, help="seed", default=72)
     parser.add_argument("--lr", type=float, help="learning rate", default=4e-4)
     parser.add_argument("--exp", type=int, help="expand mask value to", default=215)
     parser.add_argument("--threshold", type=int, help="the threshold for bounding box expansion", default=10)
@@ -359,6 +450,7 @@ if __name__ == '__main__':
     parser.add_argument("--box_prompt", action="store_true", help="whether use box prompt")
     parser.add_argument("--large", action="store_true", help="whether choose largest mask for prompting after stage 1")
     parser.add_argument("--center", action="store_true", help="whether prompt with center")
+    parser.add_argument("--hqsam", action="store_true", help="use hqsam to refine the masks")
     parser.set_defaults(box_prompt=True)
     parser.set_defaults(large=True)
     parser.set_defaults(center=True)
