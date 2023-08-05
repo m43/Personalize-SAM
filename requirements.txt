@@ -1,7 +1,13 @@
-matplotlib
-tqdm
-os
-numpy
-warnings
-argparse
-opencv-python
+# Torch version requirements, recommended to be installed w/o pip:
+#    torch==1.8.2
+#    torchvision==0.9.2
+
+scikit-image==0.21.0
+matplotlib==3.7.2
+tqdm==4.65.0
+numpy==1.24.3
+opencv-python==4.8.0.74
+pandas==2.0.3
+timm==0.9.5
+scipy==1.10.1
+imageio==2.31.1
